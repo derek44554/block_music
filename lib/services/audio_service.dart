@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -33,7 +34,8 @@ class AudioService {
     _queueIndex = index;
   }
 
-  Song? get nextSong => _queueIndex < _queue.length - 1 ? _queue[_queueIndex + 1] : null;
+  Song? get nextSong =>
+      _queueIndex < _queue.length - 1 ? _queue[_queueIndex + 1] : null;
   Song? get prevSong => _queueIndex > 0 ? _queue[_queueIndex - 1] : null;
 
   /// 启动时恢复上次播放的歌曲元数据（不自动播放）
@@ -50,14 +52,37 @@ class AudioService {
     await prefs.setString(_lastSongKey, song.toJsonString());
   }
 
-  String _buildUrl(Song song, ConnectionProvider connProvider) {
-    final cid = song.cid ?? '';
+  List<String> _buildCandidateUrls(Song song, ConnectionProvider connProvider) {
+    final cid = (song.cid ?? '').trim();
+    if (cid.isEmpty) return const [];
+
+    final urls = <String>[];
+
+    void addUrl(String? raw) {
+      final value = (raw ?? '').trim();
+      if (value.isEmpty || urls.contains(value)) return;
+      urls.add(value);
+    }
+
     final endpoint = connProvider.ipfsEndpoint;
     if (endpoint != null && endpoint.isNotEmpty) {
-      return '${endpoint.replaceAll(RegExp(r'/+$'), '')}/$cid';
+      final base = endpoint.replaceAll(RegExp(r'/+$'), '');
+      if (base.endsWith('/ipfs')) {
+        addUrl('$base/$cid');
+      } else {
+        addUrl('$base/ipfs/$cid');
+      }
+      // 一旦显式配置了 IPFS 端点，只使用该端点，避免误回退到节点地址。
+      return urls;
     }
+
     final address = connProvider.activeConnection?.address ?? '';
-    return '${address.replaceAll(RegExp(r'/+$'), '')}/ipfs/$cid';
+    final normalizedAddress = address.replaceAll(RegExp(r'/+$'), '');
+    if (normalizedAddress.isNotEmpty) {
+      addUrl('$normalizedAddress/ipfs/$cid');
+    }
+
+    return urls;
   }
 
   Future<void> play(Song song, ConnectionProvider connProvider) async {
@@ -76,12 +101,67 @@ class AudioService {
       await _player.stop();
 
       final cached = await AudioCache.instance.getCached(cid);
+      var loaded = false;
       if (cached != null) {
-        await _player.setFilePath(cached.path);
-      } else {
-        final url = _buildUrl(song, connProvider);
-        await _player.setUrl(url);
-        _cacheInBackground(url, cid);
+        try {
+          await _player.setFilePath(cached.path);
+          loaded = true;
+        } catch (e) {
+          debugPrint('AudioService.cached file invalid: ${cached.path} -> $e');
+          await AudioCache.instance.remove(cid);
+        }
+      }
+
+      if (!loaded) {
+        final urls = _buildCandidateUrls(song, connProvider);
+        if (urls.isEmpty) {
+          throw Exception('未生成可用音频 URL');
+        }
+
+        String? selectedUrl;
+        final preferLocalFirst = !kIsWeb && Platform.isMacOS;
+
+        if (!preferLocalFirst) {
+          for (final url in urls) {
+            try {
+              await _player.setUrl(url);
+              selectedUrl = url;
+              break;
+            } catch (e) {
+              debugPrint('AudioService.setUrl failed: $url -> $e');
+            }
+          }
+        }
+
+        if (selectedUrl == null) {
+          // macOS 或流式失败时，回退到先下载再本地播放
+          for (final url in urls) {
+            try {
+              final localPath = await AudioCache.instance.downloadAndCache(
+                url,
+                cid,
+              );
+              try {
+                await _player.setFilePath(localPath);
+              } catch (e) {
+                debugPrint(
+                  'AudioService.setFilePath from fallback failed: $localPath -> $e',
+                );
+                rethrow;
+              }
+              selectedUrl = url;
+              break;
+            } catch (e) {
+              debugPrint('AudioService.download fallback failed: $url -> $e');
+            }
+          }
+        } else {
+          _cacheInBackground(selectedUrl, cid);
+        }
+
+        if (selectedUrl == null) {
+          throw Exception('音频地址不可用，候选: ${urls.join(' | ')}');
+        }
       }
       await _player.play();
     } catch (e) {

@@ -22,11 +22,15 @@ class ConnectionProvider extends ChangeNotifier {
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getStringList(_storageKey) ?? [];
     _connections = raw
-        .map((e) => ConnectionModel.fromJson(jsonDecode(e) as Map<String, dynamic>))
+        .map(
+          (e) =>
+              ConnectionModel.fromJson(jsonDecode(e) as Map<String, dynamic>),
+        )
         .toList();
     final activeIndex = prefs.getInt(_activeKey) ?? 0;
     if (_connections.isNotEmpty) {
-      _activeConnection = _connections[activeIndex.clamp(0, _connections.length - 1)];
+      _activeConnection =
+          _connections[activeIndex.clamp(0, _connections.length - 1)];
     }
     _ipfsEndpoint = prefs.getString(_ipfsKey);
     notifyListeners();
@@ -64,7 +68,13 @@ class ConnectionProvider extends ChangeNotifier {
   }
 
   Future<void> setIpfsEndpoint(String? endpoint) async {
-    _ipfsEndpoint = endpoint?.trim().isEmpty == true ? null : endpoint?.trim();
+    final raw = endpoint?.trim();
+    if (raw == null || raw.isEmpty) {
+      _ipfsEndpoint = null;
+    } else {
+      // 统一去掉末尾斜杠，后续拼接由 AudioService 统一处理。
+      _ipfsEndpoint = raw.replaceAll(RegExp(r'/+$'), '');
+    }
     final prefs = await SharedPreferences.getInstance();
     if (_ipfsEndpoint != null) {
       await prefs.setString(_ipfsKey, _ipfsEndpoint!);
